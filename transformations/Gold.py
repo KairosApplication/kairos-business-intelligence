@@ -1,6 +1,6 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Teste - Notebook Gold
+# MAGIC # Notebook Gold
 # MAGIC Pega a tabela Silver, calcula e retorna as métricas que serão utilizadas:
 # MAGIC
 # MAGIC ## 1. Vendas (`daily_sales`)
@@ -65,16 +65,6 @@
 # MAGIC - **Quantidade de produtos presentes nos inventários.**
 # MAGIC
 # MAGIC ---
-# MAGIC
-# MAGIC ## Indicadores previstos no Figma que ainda não conseguimos calcular
-# MAGIC
-# MAGIC | KPI | Motivo |
-# MAGIC |---|---|
-# MAGIC | Reposições pendentes | Não existe status de reposição na tabela original. |
-# MAGIC | Taxa de conclusão de reposições | Não há informação de conclusão das tarefas. |
-# MAGIC | Tempo médio de reposição | Não existe relação confiável entre alertas e reposições, além de inconsistências nas datas dos alertas. |
-# MAGIC | Prioridades do turno | Não existe campo de prioridade nas tabelas. |
-# MAGIC | Sugestões de horários de pico | Não foi implementada uma análise específica de horários de maior movimento. |
 # MAGIC
 # MAGIC ## Resumo
 # MAGIC

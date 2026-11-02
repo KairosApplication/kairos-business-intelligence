@@ -8,12 +8,12 @@
 # DBTITLE 1,Imports e Variáveis
 from pyspark import pipelines as dp
 
-HOST = "pg-d83aacb-germinare-ec83.b.aivencloud.com"
-PORT = "25119"
-BANCO = "defaultdb"
+HOST = "placeholder"
+PORT = "placeholder"
+BANCO = "placeholder"
 URL = f"jdbc:postgresql://{HOST}:{PORT}/{BANCO}"
 
-ESCOPO = "postgres-secrets-teste"
+ESCOPO = "postgres-secrets"
 CHAVE_USUARIO = "username"
 CHAVE_SENHA = "password"
 USUARIO = dbutils.secrets.get(ESCOPO, CHAVE_USUARIO)
