@@ -89,35 +89,50 @@ from pyspark.sql.window import Window
 # ============================================================
 # 1. VENDAS DIARIAS
 # Dashboard: faturamento, vendas, ticket médio e comparação.
-# Considera os 14 dias mais recentes com vendas disponíveis.
+# Considera os 14 dias mais recentes com vendas disponíveis
+# PARA CADA EMPRESA.
+# company_id vem de Purchases -> Customers.
 # ============================================================
 
 @dp.materialized_view(name="kairos.gold.daily_sales")
 def daily_sales():
 
-    purchases = spark.table("kairos.silver.purchases")
-    items = spark.table("kairos.silver.purchase_products")
+    purchases = spark.table("kairos.silver.purchases").alias("p")
+    items = spark.table("kairos.silver.purchase_products").alias("i")
+    customers = spark.table("kairos.silver.customers").alias("c")
 
     sales = (
         purchases
-        .filter(F.col("status") == "COMPLETED")
-        .join(items, purchases.id == items.purchase_id, "inner")
-        .groupBy(
-            purchases.id.alias("purchase_id"),
-            F.to_date(purchases.date).alias("sale_date")
+        .filter(F.col("p.status") == "COMPLETED")
+        .join(
+            customers,
+            F.col("p.customer_id") == F.col("c.id"),
+            "inner"
         )
+        .join(
+            items,
+            F.col("p.id") == F.col("i.purchase_id"),
+            "inner"
+        )
+        .select(
+            F.col("c.company_id").alias("company_id"),
+            F.col("p.id").alias("purchase_id"),
+            F.to_date(F.col("p.date")).alias("sale_date"),
+            F.col("i.quantity").alias("quantity"),
+            F.col("i.amount").alias("amount"),
+            F.col("i.id").alias("item_id")
+        )
+        .groupBy("company_id", "purchase_id", "sale_date")
         .agg(
-            F.sum(
-                F.col("quantity") * F.col("amount")
-            ).alias("purchase_revenue"),
+            F.sum(F.col("quantity") * F.col("amount")).alias("purchase_revenue"),
             F.sum("quantity").alias("units_sold"),
-            F.count(items.id).alias("item_lines")
+            F.count("item_id").alias("item_lines")
         )
     )
 
     daily = (
         sales
-        .groupBy("sale_date")
+        .groupBy("company_id", "sale_date")
         .agg(
             F.sum("purchase_revenue").alias("revenue"),
             F.countDistinct("purchase_id").alias("sales_count"),
@@ -126,15 +141,14 @@ def daily_sales():
         )
     )
 
-    # Seleciona os 14 dias mais recentes com vendas.
+    # Seleciona os 14 dias mais recentes com vendas por empresa.
+    rank_window = Window.partitionBy("company_id").orderBy(
+        F.col("sale_date").desc()
+    )
+
     latest_days = (
         daily
-        .withColumn(
-            "date_rank",
-            F.row_number().over(
-                Window.orderBy(F.col("sale_date").desc())
-            )
-        )
+        .withColumn("date_rank", F.row_number().over(rank_window))
         .filter(F.col("date_rank") <= 14)
     )
 
@@ -155,18 +169,22 @@ def daily_sales():
         )
     )
 
-    # Ordena cronologicamente para calcular a comparação.
-    window = Window.orderBy("sale_date")
+    # Comparação com o dia anterior disponível da MESMA empresa.
+    comparison_window = (
+        Window
+        .partitionBy("company_id")
+        .orderBy("sale_date")
+    )
 
     return (
         result
         .withColumn(
             "previous_day_revenue",
-            F.lag("revenue", 1).over(window)
+            F.lag("revenue", 1).over(comparison_window)
         )
         .withColumn(
             "previous_day_sales",
-            F.lag("sales_count", 1).over(window)
+            F.lag("sales_count", 1).over(comparison_window)
         )
         .withColumn(
             "revenue_change_percent",
@@ -186,67 +204,82 @@ def daily_sales():
             ).otherwise("PREVIOUS_7_DAYS")
         )
         .drop("date_rank")
-        .orderBy("sale_date")
+        .orderBy("company_id", "sale_date")
     )
 
 
 # ============================================================
 # 2. VENDAS POR CATEGORIA
 # Insights: receita, unidades e participação por categoria.
-# Agrupa categorias com o mesmo nome.
+# Categorias são separadas por company_id.
 # ============================================================
 
 @dp.materialized_view(name="kairos.gold.sales_by_category")
 def sales_by_category():
 
-    purchases = spark.table("kairos.silver.purchases")
-    items = spark.table("kairos.silver.purchase_products")
-    products = spark.table("kairos.silver.products")
-    categories = spark.table("kairos.silver.categories")
+    purchases = spark.table("kairos.silver.purchases").alias("p")
+    items = spark.table("kairos.silver.purchase_products").alias("i")
+    customers = spark.table("kairos.silver.customers").alias("cu")
+    products = spark.table("kairos.silver.products").alias("pr")
+    categories = spark.table("kairos.silver.categories").alias("ca")
 
     sales = (
         items
         .join(
-            purchases.filter(F.col("status") == "COMPLETED"),
-            items.purchase_id == purchases.id,
+            purchases.filter(F.col("p.status") == "COMPLETED"),
+            F.col("i.purchase_id") == F.col("p.id"),
+            "inner"
+        )
+        .join(
+            customers,
+            F.col("p.customer_id") == F.col("cu.id"),
             "inner"
         )
         .join(
             products,
-            items.product_id == products.id,
+            (F.col("i.product_id") == F.col("pr.id")) &
+            (F.col("pr.company_id") == F.col("cu.company_id")),
             "inner"
         )
         .join(
-            categories.select(
-                "id",
-                "category"
-            ),
-            products.category_id == categories.id,
+            categories,
+            (F.col("pr.category_id") == F.col("ca.id")) &
+            (F.col("pr.company_id") == F.col("ca.company_id")),
             "left"
         )
-        .groupBy(
+        .select(
+            F.col("cu.company_id").alias("company_id"),
             F.coalesce(
-                F.col("category"),
+                F.col("ca.category"),
                 F.lit("Sem categoria")
-            ).alias("category")
-        )
-        .agg(
-            F.sum(
-                F.col("quantity") * F.col("amount")
-            ).alias("revenue"),
-            F.sum("quantity").alias("units_sold"),
-            F.countDistinct(purchases.id).alias("sales_count"),
-            F.countDistinct(products.id).alias("products_sold")
+            ).alias("category"),
+            F.col("i.quantity").alias("quantity"),
+            F.col("i.amount").alias("amount"),
+            F.col("p.id").alias("purchase_id"),
+            F.col("pr.id").alias("product_id")
         )
     )
 
-    total = sales.agg(
-        F.sum("revenue").alias("total_revenue")
+    sales = (
+        sales
+        .groupBy("company_id", "category")
+        .agg(
+            F.sum(F.col("quantity") * F.col("amount")).alias("revenue"),
+            F.sum("quantity").alias("units_sold"),
+            F.countDistinct("purchase_id").alias("sales_count"),
+            F.countDistinct("product_id").alias("products_sold")
+        )
     )
+
+    # Participação calculada dentro de cada empresa, não no total geral.
+    company_window = Window.partitionBy("company_id")
 
     return (
         sales
-        .crossJoin(total)
+        .withColumn(
+            "total_revenue",
+            F.sum("revenue").over(company_window)
+        )
         .withColumn(
             "revenue_share_percent",
             F.when(
@@ -255,20 +288,21 @@ def sales_by_category():
             ).otherwise(F.lit(0))
         )
         .drop("total_revenue")
-        .orderBy(F.desc("revenue"))
+        .orderBy("company_id", F.desc("revenue"))
     )
 
 
 # ============================================================
 # 3. ESTOQUE POR PRODUTO
 # Mantém prateleiras e inventários separados.
+# company_id vem de Products.
 # ============================================================
 
 @dp.materialized_view(name="kairos.gold.stock_by_product")
 def stock_by_product():
 
-    products = spark.table("kairos.silver.products")
-    categories = spark.table("kairos.silver.categories")
+    products = spark.table("kairos.silver.products").alias("p")
+    categories = spark.table("kairos.silver.categories").alias("c")
     shelves = spark.table("kairos.silver.product_shelves")
     inventories = spark.table("kairos.silver.product_inventories")
 
@@ -293,136 +327,103 @@ def stock_by_product():
     return (
         products
         .join(
-            categories.select(
-                "id",
-                F.col("category").alias("category")
-            ),
-            products.category_id == categories.id,
+            categories,
+            (F.col("p.category_id") == F.col("c.id")) &
+            (F.col("p.company_id") == F.col("c.company_id")),
             "left"
         )
         .join(
-            shelf_stock,
-            products.id == shelf_stock.product_id,
+            shelf_stock.alias("ss"),
+            F.col("p.id") == F.col("ss.product_id"),
             "left"
         )
         .join(
-            inventory_stock,
-            products.id == inventory_stock.product_id,
+            inventory_stock.alias("ins"),
+            F.col("p.id") == F.col("ins.product_id"),
             "left"
         )
         .select(
-            products.id.alias("product_id"),
-            products.name.alias("product_name"),
-            products.brand,
+            F.col("p.company_id").alias("company_id"),
+            F.col("p.id").alias("product_id"),
+            F.col("p.name").alias("product_name"),
+            F.col("p.brand").alias("brand"),
             F.coalesce(
-                F.col("category"),
+                F.col("c.category"),
                 F.lit("Sem categoria")
             ).alias("category"),
-            products.price,
-            F.coalesce(
-                F.col("shelf_quantity"),
-                F.lit(0)
-            ).alias("shelf_quantity"),
-            F.coalesce(
-                F.col("shelves_count"),
-                F.lit(0)
-            ).alias("shelves_count"),
-            F.coalesce(
-                F.col("inventory_quantity"),
-                F.lit(0)
-            ).alias("inventory_quantity"),
-            F.coalesce(
-                F.col("inventories_count"),
-                F.lit(0)
-            ).alias("inventories_count")
+            F.col("p.price").alias("price"),
+            F.coalesce(F.col("ss.shelf_quantity"), F.lit(0)).alias("shelf_quantity"),
+            F.coalesce(F.col("ss.shelves_count"), F.lit(0)).alias("shelves_count"),
+            F.coalesce(F.col("ins.inventory_quantity"), F.lit(0)).alias("inventory_quantity"),
+            F.coalesce(F.col("ins.inventories_count"), F.lit(0)).alias("inventories_count")
         )
     )
 
 
 # ============================================================
 # 4. RESUMO DE RUPTURAS
-# Insights: alertas por categoria, status e taxa aproximada.
 # Considera somente alertas OPEN na taxa de ruptura.
+# company_id vem de Products.
 # ============================================================
 
 @dp.materialized_view(name="kairos.gold.stockout_summary")
 def stockout_summary():
 
-    alerts = spark.table("kairos.silver.alerts")
-    products = spark.table("kairos.silver.products")
-    categories = spark.table("kairos.silver.categories")
+    alerts = spark.table("kairos.silver.alerts").alias("a")
+    products = spark.table("kairos.silver.products").alias("p")
+    categories = spark.table("kairos.silver.categories").alias("c")
 
-    product_totals = (
+    product_data = (
         products
         .join(
-            categories.select(
-                "id",
-                F.col("category").alias("category")
-            ),
-            products.category_id == categories.id,
+            categories,
+            (F.col("p.category_id") == F.col("c.id")) &
+            (F.col("p.company_id") == F.col("c.company_id")),
             "left"
         )
-        .groupBy(
+        .select(
+            F.col("p.company_id").alias("company_id"),
+            F.col("p.id").alias("product_id"),
             F.coalesce(
-                F.col("category"),
+                F.col("c.category"),
                 F.lit("Sem categoria")
             ).alias("category")
         )
+    )
+
+    product_totals = (
+        product_data
+        .groupBy("company_id", "category")
         .agg(
-            F.countDistinct(products.id).alias("total_products")
+            F.countDistinct("product_id").alias("total_products")
         )
     )
 
     alert_totals = (
         alerts
         .join(
-            products,
-            alerts.product_id == products.id,
+            product_data.alias("pd"),
+            F.col("a.product_id") == F.col("pd.product_id"),
             "inner"
         )
-        .join(
-            categories.select(
-                "id",
-                F.col("category").alias("category")
-            ),
-            products.category_id == categories.id,
-            "left"
-        )
-        .groupBy(
-            F.coalesce(
-                F.col("category"),
-                F.lit("Sem categoria")
-            ).alias("category")
-        )
+        .groupBy(F.col("pd.company_id").alias("company_id"), F.col("pd.category").alias("category"))
         .agg(
-            F.countDistinct(alerts.id).alias("total_alerts"),
+            F.countDistinct("a.id").alias("total_alerts"),
 
             F.countDistinct(
-                F.when(
-                    alerts.status == "OPEN",
-                    alerts.id
-                )
+                F.when(F.col("a.status") == "OPEN", F.col("a.id"))
             ).alias("open_alerts"),
 
             F.countDistinct(
-                F.when(
-                    alerts.status == "RESOLVED",
-                    alerts.id
-                )
+                F.when(F.col("a.status") == "RESOLVED", F.col("a.id"))
             ).alias("resolved_alerts"),
 
             F.countDistinct(
-                F.when(
-                    alerts.status == "CANCELLED",
-                    alerts.id
-                )
+                F.when(F.col("a.status") == "CANCELLED", F.col("a.id"))
             ).alias("cancelled_alerts"),
 
             F.countDistinct(
-                F.when(
-                    alerts.status == "OPEN",
-                    alerts.product_id
-                )
+                F.when(F.col("a.status") == "OPEN", F.col("a.product_id"))
             ).alias("products_with_open_alerts")
         )
     )
@@ -431,7 +432,7 @@ def stockout_summary():
         product_totals
         .join(
             alert_totals,
-            "category",
+            ["company_id", "category"],
             "left"
         )
         .fillna({
@@ -456,79 +457,151 @@ def stockout_summary():
 
 # ============================================================
 # 5. RESUMO DE REPOSIÇÕES
-# Dashboard e Insights: reposições, unidades e avarias.
+# company_id vem de Restockings -> Inventories.
 # ============================================================
 
 @dp.materialized_view(name="kairos.gold.replenishment_summary")
 def replenishment_summary():
 
-    restockings = spark.table("kairos.silver.restockings")
+    restockings = spark.table("kairos.silver.restockings").alias("r")
+    inventories = spark.table("kairos.silver.inventories").alias("i")
 
     return (
         restockings
+        .join(
+            inventories,
+            F.col("r.inventory_id") == F.col("i.id"),
+            "inner"
+        )
         .groupBy(
-            F.to_date("restocking_date").alias("restocking_day")
+            F.col("i.company_id").alias("company_id"),
+            F.to_date(F.col("r.restocking_date")).alias("restocking_day")
         )
         .agg(
-            F.count("id").alias("restockings_count"),
-            F.sum("restocked_quantity").alias("units_restocked"),
-            F.sum("qnt_avarias").alias("damaged_units"),
-            F.countDistinct("product_id").alias("products_restocked"),
-            F.countDistinct("employee_id").alias("employees_involved")
+            F.count(F.col("r.id")).alias("restockings_count"),
+            F.sum(F.col("r.restocked_quantity")).alias("units_restocked"),
+            F.sum(F.col("r.qnt_avarias")).alias("damaged_units"),
+            F.countDistinct(F.col("r.product_id")).alias("products_restocked"),
+            F.countDistinct(F.col("r.employee_id")).alias("employees_involved")
         )
+        .orderBy("company_id", "restocking_day")
     )
 
 
 # ============================================================
 # 6. RESUMO GERAL DA OPERAÇÃO
-# Indicadores gerais para os cards do Dashboard.
+# Uma linha por empresa.
 # ============================================================
 
 @dp.materialized_view(name="kairos.gold.operations_summary")
 def operations_summary():
 
+    companies = spark.table("kairos.silver.companies").select(
+        F.col("id").alias("company_id")
+    )
+
     products = spark.table("kairos.silver.products")
-    alerts = spark.table("kairos.silver.alerts")
-    restockings = spark.table("kairos.silver.restockings")
-    shelves = spark.table("kairos.silver.product_shelves")
-    inventories = spark.table("kairos.silver.product_inventories")
+    alerts = spark.table("kairos.silver.alerts").alias("a")
+    restockings = spark.table("kairos.silver.restockings").alias("r")
+    inventories = spark.table("kairos.silver.inventories").alias("i")
+    shelves = spark.table("kairos.silver.product_shelves").alias("ps")
+    product_inventories = spark.table("kairos.silver.product_inventories").alias("pi")
 
-    product_metrics = products.agg(
-        F.countDistinct("id").alias("total_products")
+    product_metrics = (
+        products
+        .groupBy("company_id")
+        .agg(
+            F.countDistinct("id").alias("total_products")
+        )
     )
 
-    alert_metrics = alerts.agg(
-        F.countDistinct(
-            F.when(
-                F.col("status") == "OPEN",
-                F.col("id")
-            )
-        ).alias("open_alerts"),
-
-        F.countDistinct("id").alias("total_alerts")
+    # Alertas são atribuídos à empresa proprietária do produto.
+    alert_metrics = (
+        alerts
+        .join(
+            products.select(
+                F.col("id").alias("product_id"),
+                "company_id"
+            ).alias("p"),
+            F.col("a.product_id") == F.col("p.product_id"),
+            "inner"
+        )
+        .groupBy(F.col("p.company_id").alias("company_id"))
+        .agg(
+            F.countDistinct(
+                F.when(F.col("a.status") == "OPEN", F.col("a.id"))
+            ).alias("open_alerts"),
+            F.countDistinct(F.col("a.id")).alias("total_alerts")
+        )
     )
 
-    restocking_metrics = restockings.agg(
-        F.countDistinct("id").alias("total_restockings"),
-        F.sum("restocked_quantity").alias("total_units_restocked"),
-        F.sum("qnt_avarias").alias("total_damaged_units")
+    # Reposições são atribuídas à empresa proprietária do inventário.
+    restocking_metrics = (
+        restockings
+        .join(
+            inventories,
+            F.col("r.inventory_id") == F.col("i.id"),
+            "inner"
+        )
+        .groupBy(F.col("i.company_id").alias("company_id"))
+        .agg(
+            F.countDistinct(F.col("r.id")).alias("total_restockings"),
+            F.sum(F.col("r.restocked_quantity")).alias("total_units_restocked"),
+            F.sum(F.col("r.qnt_avarias")).alias("total_damaged_units")
+        )
     )
 
-    shelf_metrics = shelves.agg(
-        F.sum("product_quantity").alias("total_shelf_quantity"),
-        F.countDistinct("product_id").alias("products_on_shelves")
+    # Estoque de prateleiras atribuído à empresa do produto.
+    shelf_metrics = (
+        shelves
+        .join(
+            products.select(
+                F.col("id").alias("product_id"),
+                "company_id"
+            ).alias("p"),
+            F.col("ps.product_id") == F.col("p.product_id"),
+            "inner"
+        )
+        .groupBy(F.col("p.company_id").alias("company_id"))
+        .agg(
+            F.sum(F.col("ps.product_quantity")).alias("total_shelf_quantity"),
+            F.countDistinct(F.col("ps.product_id")).alias("products_on_shelves")
+        )
     )
 
-    inventory_metrics = inventories.agg(
-        F.sum("product_quantity").alias("total_inventory_quantity"),
-        F.countDistinct("product_id").alias("products_in_inventories")
+    # Estoque de inventários atribuído à empresa do inventário.
+    inventory_metrics = (
+        product_inventories
+        .join(
+            inventories,
+            F.col("pi.inventory_id") == F.col("i.id"),
+            "inner"
+        )
+        .groupBy(F.col("i.company_id").alias("company_id"))
+        .agg(
+            F.sum(F.col("pi.product_quantity")).alias("total_inventory_quantity"),
+            F.countDistinct(F.col("pi.product_id")).alias("products_in_inventories")
+        )
     )
 
     return (
-        product_metrics
-        .crossJoin(alert_metrics)
-        .crossJoin(restocking_metrics)
-        .crossJoin(shelf_metrics)
-        .crossJoin(inventory_metrics)
-        .fillna(0)
+        companies
+        .join(product_metrics, "company_id", "left")
+        .join(alert_metrics, "company_id", "left")
+        .join(restocking_metrics, "company_id", "left")
+        .join(shelf_metrics, "company_id", "left")
+        .join(inventory_metrics, "company_id", "left")
+        .fillna({
+            "total_products": 0,
+            "open_alerts": 0,
+            "total_alerts": 0,
+            "total_restockings": 0,
+            "total_units_restocked": 0,
+            "total_damaged_units": 0,
+            "total_shelf_quantity": 0,
+            "products_on_shelves": 0,
+            "total_inventory_quantity": 0,
+            "products_in_inventories": 0
+        })
+        .orderBy("company_id")
     )
